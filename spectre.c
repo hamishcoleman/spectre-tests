@@ -145,9 +145,13 @@ void readMemoryByte(size_t malicious_x, uint8_t value[2], int score[2]) {
     if (results[j] >= (2 * results[k] + 5) || (results[j] == 2 && results[k] == 0))
       break; /* Clear success if best is > 2*runner-up + 5 or 2/0) */
   }
+
+#if 0
+  /* dump the entire table for checks */
   for (i = 0; i < 256; i++) {
     printf("Average time for %d: %f, hits: %d\n", i, (double) (time[i] / num_time[i]), results[i]);
   }
+#endif
 
   results[0] ^= junk; /* use junk so code above won’t get optimized out*/
   value[0] = (uint8_t) j;
