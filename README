@@ -1,0 +1,8 @@
+This repository contains some simple tests for the spectre bug.  This attack
+is described at https://meltdownattack.com/ and has more reading material at
+https://googleprojectzero.blogspot.hk/2018/01/reading-privileged-memory-with-side.html
+
+While my original source for the code is from the contents of a github gist,
+reading the Spectre paper reveals that this code is included in that paper as
+and example implementation.
+
