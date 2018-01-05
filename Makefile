@@ -2,7 +2,12 @@
 # Simple test for the spectre issue
 #
 
-all: spectre spectre_pthread
+TARGETS := spectre spectre_pthread
+
+all: $(TARGETS)
+
+clean:
+	rm -f $(TARGETS)
 
 test: all
 	./spectre
