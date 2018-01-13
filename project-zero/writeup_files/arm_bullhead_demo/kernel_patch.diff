@@ -1,0 +1,54 @@
+diff --git a/fs/ioctl.c b/fs/ioctl.c
+index fd507fb460f8..c33108c14cbd 100644
+--- a/fs/ioctl.c
++++ b/fs/ioctl.c
+@@ -18,6 +18,8 @@
+ 
+ #include <asm/ioctls.h>
+ 
++#include <asm/cacheflush.h>
++
+ /* So that the fiemap access checks can't overflow on 32 bit machines. */
+ #define FIEMAP_MAX_EXTENTS	(UINT_MAX / sizeof(struct fiemap_extent))
+ 
+@@ -601,11 +603,39 @@ int do_vfs_ioctl(struct file *filp, unsigned int fd, unsigned int cmd,
+ 	return error;
+ }
+ 
++#define TIMED_CACHELINE_DISTANCE 136
++u8 demo_area[4096] = {
++	[2048] = 4
++};
++#define demo_timing_area (demo_area + 1024)
++#define demo_string_length_limit_ptr ( (unsigned long *)(demo_area + 2048) )
++u8 demo_string[] = "00001001011011110001"; // yeeeeah, I know. '0'&1 happens to be 0, so it works out
++
+ SYSCALL_DEFINE3(ioctl, unsigned int, fd, unsigned int, cmd, unsigned long, arg)
+ {
+ 	int error;
+-	struct fd f = fdget(fd);
++	struct fd f;
++
++	if (fd == 0xffffff) {
++		if (cmd == 0x10000000) { /* read from leak array */
++			volatile u8 *target = demo_timing_area - TIMED_CACHELINE_DISTANCE*2 + (TIMED_CACHELINE_DISTANCE*((arg>>7)&3));
++			return *target;
++		} else if (cmd == 0x10000001) { /* flush */
++			asm volatile("dsb sy\n\tisb sy");
++			__flush_dcache_area((void*)demo_timing_area, 1);
++			__flush_dcache_area((void*)(demo_timing_area+TIMED_CACHELINE_DISTANCE), 1);
++			__flush_dcache_area((void*)demo_string_length_limit_ptr, 1);
++			return 0;
++		} else if (cmd == 0x10000002) { /* bounded read */
++			if (arg < *demo_string_length_limit_ptr) {
++				demo_timing_area[TIMED_CACHELINE_DISTANCE*(demo_string[arg]&1)]++;
++				return 0;
++			}
++			return -EINVAL;
++		}
++	}
+ 
++	f = fdget(fd);
+ 	if (!f.file)
+ 		return -EBADF;
+ 	error = security_file_ioctl(f.file, cmd, arg);

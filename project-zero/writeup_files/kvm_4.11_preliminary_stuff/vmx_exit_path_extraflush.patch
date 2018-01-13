@@ -1,0 +1,29 @@
+diff -U5 -r pristine/linux-4.11/arch/x86/kvm/vmx.c linux-4.11/arch/x86/kvm/vmx.c
+--- pristine/linux-4.11/arch/x86/kvm/vmx.c	2017-05-01 04:47:48.000000000 +0200
++++ linux-4.11/arch/x86/kvm/vmx.c	2017-05-29 18:04:50.843640388 +0200
+@@ -9086,10 +9086,25 @@
+ #else
+ 		, "eax", "ebx", "edi", "esi"
+ #endif
+ 	      );
+ 
++        asm volatile(
++            "clflush %0\n\t"
++            "push %%rax\n\t"
++            "push %%rbx\n\t"
++            "push %%rcx\n\t"
++            "push %%rdx\n\t"
++            "mov $0, %%rax\n\t"
++            "cpuid\n\t"
++            "pop %%rdx\n\t"
++            "pop %%rcx\n\t"
++            "pop %%rbx\n\t"
++            "pop %%rax\n\t"
++        : /*out*/ : "m"(kvm_x86_ops->handle_external_intr)
++        );
++
+ 	/* MSR_IA32_DEBUGCTLMSR is zeroed on vmexit. Restore it if needed */
+ 	if (debugctlmsr)
+ 		update_debugctlmsr(debugctlmsr);
+ 
+ #ifndef CONFIG_X86_64

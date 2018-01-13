@@ -1,0 +1,29 @@
+diff --git a/kvm-all.c b/kvm-all.c
+index 90b8573656..e9ee3c9c1e 100644
+--- a/kvm-all.c
++++ b/kvm-all.c
+@@ -14,6 +14,7 @@
+  */
+ 
+ #include "qemu/osdep.h"
++#include <err.h>
+ #include <sys/ioctl.h>
+ 
+ #include <linux/kvm.h>
+@@ -244,6 +245,16 @@ static int kvm_set_user_memory_region(KVMMemoryListener *kml, KVMSlot *slot)
+     mem.userspace_addr = (unsigned long)slot->ram;
+     mem.flags = slot->flags;
+ 
++
++    char logline[1000];
++    sprintf(logline, "guest:0x%lx host_user:0x%lx len:0x%lx\n", (unsigned long)mem.guest_phys_addr, (unsigned long)mem.userspace_addr, (unsigned long)slot->memory_size);
++    int mem_log_fd = open("/tmp/qemu_kvm_mem_log", O_APPEND|O_CREAT|O_WRONLY, 0644);
++    if (mem_log_fd == -1)
++        err(1, "mem_log_fd");
++    if (write(mem_log_fd, logline, strlen(logline)) != strlen(logline))
++        err(1, "mem_log_fd write");
++    close(mem_log_fd);
++
+     if (slot->memory_size && mem.flags & KVM_MEM_READONLY) {
+         /* Set the slot size to 0 before setting the slot to the desired
+          * value. This is needed based on KVM commit 75d61fbc. */
