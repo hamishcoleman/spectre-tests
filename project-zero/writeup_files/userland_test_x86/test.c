@@ -96,7 +96,7 @@ int main(void) {
     int latency_at_b0 = flush_addr(timing_leak_array);
     int latency_at_b1 = flush_addr(timing_leak_array + (1<<10));
     if (mislead == 31) {
-      printf("(%d,%d)\t", latency_at_b0, latency_at_b1);
+      printf("(%d,%d)= %c\t", latency_at_b0, latency_at_b1, (latency_at_b0 > latency_at_b1)?'1':'0');
     }
   }
   printf("\n");
