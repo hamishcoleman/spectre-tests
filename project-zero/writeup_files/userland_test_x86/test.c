@@ -45,8 +45,10 @@ extern unsigned long j_limit;
 int main_j;
 
 int main(void) {
+#if 0
   if (mlockall(MCL_CURRENT|MCL_FUTURE))
     err(1, "mlockall");
+#endif
 
   for (int i=0; i < LT_SIZE; i++) {
     lookup_table[i] = random() % LT_SIZE;
