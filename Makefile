@@ -4,6 +4,9 @@
 
 TARGETS := spectre spectre_pthread
 
+CFLAGS := -msse2
+CC = gcc $(CFLAGS) -g -Wall
+
 all: $(TARGETS)
 
 clean:
@@ -14,8 +17,8 @@ test: all
 	./spectre_pthread
 
 spectre: spectre.c
-	$(CC) -g -Wall -o $@ $<
+	$(CC) -o $@ $<
 
 spectre_pthread: spectre.c
-	$(CC) -g -Wall -DPTHREAD -lpthread -o $@ $<
+	$(CC) -DPTHREAD -lpthread -o $@ $<
 
