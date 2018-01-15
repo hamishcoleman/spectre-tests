@@ -4,5 +4,5 @@ https://googleprojectzero.blogspot.hk/2018/01/reading-privileged-memory-with-sid
 
 While my original source for the code is from the contents of a github gist,
 reading the Spectre paper reveals that this code is included in that paper as
-and example implementation.
+their example implementation.
 
